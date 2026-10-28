@@ -36,6 +36,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -319,6 +320,94 @@ class TestFirefoxHsts(FirefoxArtifactBase):
         self.assertEqual(r.hits, [])
         self.assertIn("firefox:hsts", [c.name for c in r.checks if c.ran])
         self.assertEqual(r.status, CLEAN)
+
+
+class TestBrowserPermissionDiagnostics(BrowserLaunchBase):
+    def test_locked_note_distinguishes_db_lock_from_permission_denial(self):
+        # Actual database lock
+        lock_exc = sqlite3.OperationalError("database is locked")
+        note = browser._locked_note(r"C:\fake\Google\Chrome\Default\History", lock_exc)
+        self.assertIn("Chrome was running", note)
+        self.assertIn("databases was locked", note)
+
+        # OS permission denial (non-macOS)
+        perm_exc = PermissionError(13, "Permission denied")
+        with patch.object(browser.sys, "platform", "linux"):
+            note = browser._locked_note("/home/u/.config/google-chrome/Default/History", perm_exc)
+            self.assertIn("access denied reading", note)
+            self.assertNotIn("was running", note)
+            self.assertNotIn("databases was locked", note)
+
+        # OS permission denial on macOS includes Privacy & Security guidance
+        with patch.object(browser.sys, "platform", "darwin"):
+            note = browser._locked_note("/Users/u/Library/Application Support/Google/Chrome/Default/History", perm_exc)
+            self.assertIn("access denied reading", note)
+            self.assertIn("Privacy & Security", note)
+            self.assertIn("Full Disk Access", note)
+            self.assertNotIn("was running", note)
+
+    def test_directory_access_denied_is_never_reported_as_running_browser(self):
+        dir_path = os.path.join(self.tmp, "fake_chrome_dir")
+        os.makedirs(dir_path, exist_ok=True)
+        perm_exc = PermissionError(13, "Permission denied")
+
+        with patch.object(browser.sys, "platform", "darwin"):
+            note = browser._locked_note(dir_path, perm_exc, is_dir=True)
+            self.assertIn("access denied reading directory", note)
+            self.assertIn("Full Disk Access", note)
+            self.assertNotIn("was running", note)
+            self.assertNotIn("databases was locked", note)
+
+    def test_chromium_profile_enumeration_permission_denied_records_gap_without_running_claim(self):
+        user_data = os.path.join(self.tmp, "User Data")
+        os.makedirs(user_data, exist_ok=True)
+
+        def mock_profiles(_root):
+            raise PermissionError(13, "Permission denied")
+
+        with patch.object(browser, "chromium_profiles", side_effect=mock_profiles):
+            r = self.run_chromium(user_data)
+            self.assertEqual(r.hits, [])
+            gaps = [c for c in r.checks if not c.ran]
+            self.assertTrue(gaps, "unreadable profile directory must be recorded as a gap")
+            prof_gap = next((c for c in gaps if c.name == "test:profiles"), None)
+            self.assertIsNotNone(prof_gap)
+            self.assertIn("access denied reading directory", prof_gap.reason)
+            self.assertNotIn("was running", prof_gap.reason)
+            self.assertNotIn("databases was locked", prof_gap.reason)
+
+    def test_firefox_profiles_dir_permission_denied_records_gap_without_running_claim(self):
+        ff_dir = os.path.join(self.tmp, "Firefox_Profiles")
+        os.makedirs(ff_dir, exist_ok=True)
+        browser.FIREFOX_ROOTS = [(ff_dir, self.empty)]
+
+        orig_listdir = os.listdir
+
+        def mock_listdir(path):
+            if path == ff_dir:
+                raise PermissionError(13, "Permission denied")
+            return orig_listdir(path)
+
+        with patch("os.listdir", side_effect=mock_listdir):
+            r = browser.run(self.ctx)
+            gaps = [c for c in r.checks if not c.ran]
+            prof_gap = next((c for c in gaps if c.name == "firefox:profiles"), None)
+            self.assertIsNotNone(prof_gap)
+            self.assertIn("access denied reading directory", prof_gap.reason)
+            self.assertNotIn("was running", prof_gap.reason)
+
+    def test_browser_name_recognition_for_macos_firefox_and_chromium(self):
+        lock_exc = sqlite3.OperationalError("database is locked")
+
+        # macOS Firefox path (which lacks "mozilla" marker)
+        mac_ff = "/Users/test/Library/Application Support/Firefox/Profiles/abc.default/places.sqlite"
+        note = browser._locked_note(mac_ff, lock_exc)
+        self.assertIn("Firefox was running", note)
+
+        # Chromium path
+        chromium_path = "/home/test/.config/chromium/Default/History"
+        note = browser._locked_note(chromium_path, lock_exc)
+        self.assertIn("Chromium was running", note)
 
 
 if __name__ == "__main__":

@@ -347,33 +347,97 @@ def _fmt_time(conv, raw):
         return ""
 
 
-def _locked_note(path, exc):
-    """A locked database is the most common non-error a user will see, so say
-    what it means and what to do rather than printing a raw errno.
+def _is_db_locked(exc):
+    """True if exc represents an SQLite database locked by a running process."""
+    msg = str(exc).lower()
+    if "database is locked" in msg or "database is busy" in msg:
+        return True
+    if sys.platform == "win32":
+        if getattr(exc, "winerror", None) in (32, 33):
+            return True
+        if "used by another process" in msg or "sharing violation" in msg:
+            return True
+    # Simulated locks in tests may raise PermissionError("locked")
+    if "locked" in msg and not ("permission denied" in msg or "operation not permitted" in msg or "access is denied" in msg):
+        return True
+    return False
 
-    A running browser causes this two ways: the OS refuses the snapshot with a
-    sharing violation (PermissionError / errno 13 on Windows), or SQLite reports
-    "database is locked" when the copy is opened. Both mean the same thing to the
-    person reading the report: close the browser and run again."""
+
+def _is_permission_denied(exc):
+    """True if exc represents an OS permission or access control denial."""
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) in (1, 13):
+        return True
+    if getattr(exc, "winerror", None) == 5:
+        return True
+    msg = str(exc).lower()
+    return ("permission denied" in msg or "operation not permitted" in msg
+            or "access is denied" in msg)
+
+
+def _locked_note(path, exc, browser_name=None, is_dir=None):
+    """A locked database is a common non-error when a browser is open, so say
+    what it means rather than printing a raw errno. When access is denied by OS
+    permissions (such as macOS privacy settings), report that distinction so the
+    user knows to check permissions rather than closing an unopen browser.
+
+    A running browser causes a lock when:
+      1. SQLite reports "database is locked" or "database is busy".
+      2. Windows refuses the snapshot with a sharing violation (WinError 32).
+
+    Access denied on directories or files without a sharing lock indicates OS
+    permission restrictions. On macOS, suggest checking terminal permissions."""
     leftover = getattr(exc, "snapshot_leftover", "")
     cleanup_warning = (
         " WARNING: temporary snapshot cleanup failed; a copy of browser data "
         "may remain at {}. Remove this temporary directory when its files can "
         "be released.".format(leftover) if leftover else "")
-    browser_name = "the browser"
-    lowered = path.lower()
-    for marker, label in (("bravesoftware", "Brave"), ("vivaldi", "Vivaldi"),
-                          ("google", "Chrome"), ("microsoft", "Edge"),
-                          ("mozilla", "Firefox")):
-        if marker in lowered:
-            browser_name = label
-            break
-    if (isinstance(exc, PermissionError) or getattr(exc, "errno", None) == 13
-            or "locked" in str(exc).lower()):
+
+    if not browser_name:
+        browser_name = "the browser"
+        lowered = path.lower()
+        for marker, label in (("bravesoftware", "Brave"), ("vivaldi", "Vivaldi"),
+                              ("google", "Chrome"), ("microsoft", "Edge"),
+                              ("mozilla", "Firefox"), ("firefox", "Firefox"),
+                              ("chromium", "Chromium")):
+            if marker in lowered:
+                browser_name = label
+                break
+
+    if is_dir is None:
+        try:
+            is_dir = os.path.isdir(path)
+        except OSError:
+            is_dir = False
+
+    # A directory is never an SQLite database lock.
+    if is_dir:
+        if _is_permission_denied(exc):
+            if sys.platform == "darwin":
+                return ("access denied reading directory {}: {}. On macOS, ensure "
+                        "the launching terminal app has permission in System Settings "
+                        "> Privacy & Security (Full Disk Access)."
+                        .format(path, exc) + cleanup_warning)
+            return ("access denied reading directory {}: {}"
+                    .format(path, exc) + cleanup_warning)
+        return "could not read directory {}: {}".format(path, exc) + cleanup_warning
+
+    # For files: distinguish actual database locks from permission denials.
+    if _is_db_locked(exc):
         return ("{} was running, so one of its databases was locked and could "
                 "not be checked ({}). Close {} and run again to cover it."
                 .format(browser_name, os.path.basename(path), browser_name)
                 + cleanup_warning)
+
+    if _is_permission_denied(exc):
+        if sys.platform == "darwin":
+            return ("access denied reading {}: {}. On macOS, ensure the launching "
+                    "terminal app has permission in System Settings > Privacy & "
+                    "Security (Full Disk Access).".format(path, exc)
+                    + cleanup_warning)
+        return "access denied reading {}: {}".format(path, exc) + cleanup_warning
+
     return "could not read {}: {}".format(path, exc) + cleanup_warning
 
 
@@ -895,8 +959,9 @@ def run(ctx) -> ModuleResult:
             return  # artifact absent for this profile — not a gap
         except OSError as exc:
             r.skipped += 1
-            r.note(_locked_note(root, exc))
-            mark_fail(label, kind, _locked_note(root, exc))
+            note = _locked_note(root, exc, is_dir=True)
+            r.note(note)
+            mark_fail(label, kind, note)
             return
 
         failures = []
@@ -1173,7 +1238,7 @@ def run(ctx) -> ModuleResult:
             profs = chromium_profiles(root)
         except OSError as exc:
             # One bad ACL on the user-data root must not abort the whole module.
-            r.could_not_run(label + ":profiles", _locked_note(root, exc))
+            r.could_not_run(label + ":profiles", _locked_note(root, exc, is_dir=True))
             continue
         names = _chromium_profile_names(root)
         ctx.emit("[*] {} ({} profile(s))".format(root, len(profs)))
@@ -1232,12 +1297,13 @@ def run(ctx) -> ModuleResult:
                 folders.update(os.listdir(profiles_dir))
             except OSError as exc:
                 r.could_not_run("firefox:profiles",
-                                _locked_note(profiles_dir, exc))
+                                _locked_note(profiles_dir, exc, is_dir=True))
         if cache_is_dir:
             try:
                 folders.update(os.listdir(cache_dir))
             except OSError as exc:
-                r.could_not_run("firefox:cache-dir", _locked_note(cache_dir, exc))
+                r.could_not_run("firefox:cache-dir",
+                                _locked_note(cache_dir, exc, is_dir=True))
 
         for name in sorted(folders):
             prof = os.path.join(profiles_dir, name)
